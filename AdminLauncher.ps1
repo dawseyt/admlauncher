@@ -181,10 +181,10 @@ function Initialize-Config {
     $defaultConfig = [pscustomobject]@{
         Theme = "Dark"
         Apps = @(
-            [pscustomobject]@{ Name = "Command Prompt"; Path = "cmd.exe"; Arguments = ""; Icon = ""; AutoLaunch = $false },
-            [pscustomobject]@{ Name = "Registry Editor"; Path = "regedit.exe"; Arguments = ""; Icon = ""; AutoLaunch = $false },
-            [pscustomobject]@{ Name = "Computer Mgmt"; Path = "compmgmt.msc"; Arguments = ""; Icon = ""; AutoLaunch = $false },
-            [pscustomobject]@{ Name = "PowerShell"; Path = "powershell.exe"; Arguments = ""; Icon = ""; AutoLaunch = $false }
+            [pscustomobject]@{ Name = "Command Prompt"; Path = "cmd.exe"; Arguments = ""; Icon = ""; AutoLaunch = $false; Pinned = $false },
+            [pscustomobject]@{ Name = "Registry Editor"; Path = "regedit.exe"; Arguments = ""; Icon = ""; AutoLaunch = $false; Pinned = $false },
+            [pscustomobject]@{ Name = "Computer Mgmt"; Path = "compmgmt.msc"; Arguments = ""; Icon = ""; AutoLaunch = $false; Pinned = $false },
+            [pscustomobject]@{ Name = "PowerShell"; Path = "powershell.exe"; Arguments = ""; Icon = ""; AutoLaunch = $false; Pinned = $false }
         )
     }
     $defaultConfig | ConvertTo-Json -Depth 3 | Set-Content -Path $ConfigPath -Encoding UTF8
@@ -207,104 +207,173 @@ if (-not (Test-Path -Path $ConfigPath)) {
     }
 }
 
-$global:Apps = @($global:AppConfig.Apps)
-$global:IsDarkTheme = ($global:AppConfig.Theme -eq "Dark")
+function Get-SystemUsesLightTheme {
+    try {
+        $value = Get-ItemPropertyValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+        return ([int]$value -eq 1)
+    } catch {
+        return $false
+    }
+}
+
+function Sync-AppStateFromConfig {
+    param([object]$Config)
+    if ($null -eq $Config.Apps) { $Config | Add-Member -NotePropertyName Apps -NotePropertyValue @() -Force }
+    foreach ($app in @($Config.Apps)) {
+        if ($null -eq $app.PSObject.Properties['Pinned']) { $app | Add-Member -NotePropertyName Pinned -NotePropertyValue $false -Force }
+        if ($null -eq $app.PSObject.Properties['AutoLaunch']) { $app | Add-Member -NotePropertyName AutoLaunch -NotePropertyValue $false -Force }
+        if ($null -eq $app.PSObject.Properties['Arguments']) { $app | Add-Member -NotePropertyName Arguments -NotePropertyValue '' -Force }
+        if ($null -eq $app.PSObject.Properties['Icon']) { $app | Add-Member -NotePropertyName Icon -NotePropertyValue '' -Force }
+    }
+    $global:AppConfig = $Config
+    $global:Apps = @($Config.Apps)
+    $global:IsDarkTheme = -not (Get-SystemUsesLightTheme)
+    $global:AppConfig.Theme = if ($global:IsDarkTheme) { 'Dark' } else { 'Light' }
+}
+
+Sync-AppStateFromConfig -Config $global:AppConfig
+
+$global:IconCache = [System.Collections.Generic.Dictionary[string, System.Windows.Media.Imaging.BitmapSource]]::new()
+$global:IsShuttingDown = $false
+$global:SuppressConfigWatcher = $false
 
 # -------------------------------------------------------------------------
-# 4. Execution Helper & Icon Extractor
+# 4. Execution, Configuration, Process Monitoring & Icon Helpers
 # -------------------------------------------------------------------------
-function Invoke-AdminApp {
-    param([string]$Path, [string]$Arguments = "")
-    $expandedPath = [System.Environment]::ExpandEnvironmentVariables($Path)
-    $launchParams = @{ FilePath = $expandedPath; ErrorAction = 'Stop' }
-    if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
-        $launchParams.ArgumentList = [System.Environment]::ExpandEnvironmentVariables($Arguments)
-    }
+function Save-LauncherConfig {
+    param([object]$Config = $global:AppConfig)
+    $global:SuppressConfigWatcher = $true
     try {
-        Start-Process @launchParams
+        $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $ConfigPath -Encoding UTF8
+    } finally {
+        $releaseTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $releaseTimer.Interval = [TimeSpan]::FromMilliseconds(750)
+        $releaseTimer.Add_Tick({ $global:SuppressConfigWatcher = $false; $this.Stop() })
+        $releaseTimer.Start()
+    }
+}
+
+function Reload-LauncherConfig {
+    try {
+        $rawConfig = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
+        if ($rawConfig -is [array]) { $rawConfig = [pscustomobject]@{ Theme = 'Dark'; Apps = $rawConfig } }
+        Sync-AppStateFromConfig -Config $rawConfig
+        if (Get-Command Update-UIContainer -ErrorAction SilentlyContinue) { Update-UIContainer }
+        if ($window -and ("Win11Interop8.Theme" -as [type])) { [Win11Interop8.Theme]::ApplyMica($window, $global:IsDarkTheme) }
     } catch {
-        [System.Windows.MessageBox]::Show("Failed to launch: $expandedPath`nError: $_", "Execution Error", 0, 16)
+        Write-Warning "Failed to reload launcher config: $_"
+    }
+}
+
+function Resolve-LauncherPath {
+    param([string]$Path)
+    $expandedPath = [System.Environment]::ExpandEnvironmentVariables($Path)
+    if ($expandedPath.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path $expandedPath)) {
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut($expandedPath)
+            if (-not [string]::IsNullOrWhiteSpace($shortcut.TargetPath)) { $expandedPath = $shortcut.TargetPath }
+        } catch {}
+    }
+    return $expandedPath
+}
+
+function Invoke-AdminApp {
+    param([string]$Path, [string]$Arguments = '')
+    $expandedPath = Resolve-LauncherPath -Path $Path
+    $launchParams = @{ FilePath = $expandedPath; ErrorAction = 'Stop' }
+    if (-not [string]::IsNullOrWhiteSpace($Arguments)) { $launchParams.ArgumentList = [System.Environment]::ExpandEnvironmentVariables($Arguments) }
+    try { Start-Process @launchParams }
+    catch { [System.Windows.MessageBox]::Show("Failed to launch: $expandedPath`nError: $_", 'Execution Error', 0, 16) }
+}
+
+function Invoke-StandardUserApp {
+    param([string]$Path, [string]$Arguments = '')
+    $expandedPath = Resolve-LauncherPath -Path $Path
+    try {
+        # Shell.Application is brokered through Explorer and launches with the interactive user's filtered token.
+        $shell = New-Object -ComObject Shell.Application
+        $shell.ShellExecute($expandedPath, [System.Environment]::ExpandEnvironmentVariables($Arguments), '', 'open', 1)
+    } catch {
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $expandedPath
+            $psi.Arguments = [System.Environment]::ExpandEnvironmentVariables($Arguments)
+            $psi.UseShellExecute = $true
+            $psi.Verb = 'open'
+            $psi.WorkingDirectory = if (Test-Path $expandedPath) { Split-Path -Path $expandedPath -Parent } else { $PSScriptRoot }
+            [System.Diagnostics.Process]::Start($psi) | Out-Null
+        } catch {
+            [System.Windows.MessageBox]::Show("Failed to launch as standard user: $expandedPath`nError: $_", 'Execution Error', 0, 16)
+        }
     }
 }
 
 function Get-AppIconSource {
     param([string]$AppPath, [string]$CustomIconPath)
-
+    $cacheKey = "$CustomIconPath|$AppPath"
+    if ($global:IconCache.ContainsKey($cacheKey)) { return $global:IconCache[$cacheKey] }
+    $imageSource = $null
     if (-not [string]::IsNullOrWhiteSpace($CustomIconPath)) {
         $expandedCustom = [System.Environment]::ExpandEnvironmentVariables($CustomIconPath)
         if (Test-Path $expandedCustom) {
             try {
-                $uri = New-Object System.Uri($expandedCustom, [System.UriKind]::Absolute)
                 $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
-                $bmp.BeginInit()
-                $bmp.UriSource = $uri
-                $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-                $bmp.EndInit()
-                return $bmp
+                $bmp.BeginInit(); $bmp.UriSource = [System.Uri]::new($expandedCustom, [System.UriKind]::Absolute); $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad; $bmp.EndInit(); $bmp.Freeze()
+                $imageSource = $bmp
             } catch { Write-Warning "Failed to load custom icon: $expandedCustom" }
         }
     }
-
-    if (-not [string]::IsNullOrWhiteSpace($AppPath)) {
-        $targetPath = [System.Environment]::ExpandEnvironmentVariables($AppPath)
-
-        if ($targetPath.EndsWith(".lnk", "OrdinalIgnoreCase")) {
-            try {
-                $shell = New-Object -ComObject WScript.Shell
-                $shortcut = $shell.CreateShortcut($targetPath)
-                if (-not [string]::IsNullOrWhiteSpace($shortcut.TargetPath)) {
-                    $targetPath = $shortcut.TargetPath
-                }
-            } catch {}
-        }
-
-        if (-not (Test-Path $targetPath)) {
-            $foundPath = (Get-Command $targetPath -ErrorAction Ignore).Source
-            if ($foundPath) { $targetPath = $foundPath }
-        }
-
+    if ($null -eq $imageSource -and -not [string]::IsNullOrWhiteSpace($AppPath)) {
+        $targetPath = Resolve-LauncherPath -Path $AppPath
+        if (-not (Test-Path $targetPath)) { $foundPath = (Get-Command $targetPath -ErrorAction Ignore).Source; if ($foundPath) { $targetPath = $foundPath } }
         if (Test-Path $targetPath) {
             try {
                 $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($targetPath)
                 if ($icon) {
-                    $imageSource = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
-                        $icon.Handle,
-                        [System.Windows.Int32Rect]::Empty,
-                        [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions()
-                    )
-                    $icon.Dispose()
-                    return $imageSource
+                    $imageSource = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon($icon.Handle, [System.Windows.Int32Rect]::Empty, [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+                    $imageSource.Freeze(); $icon.Dispose()
                 }
             } catch { Write-Warning "Failed to extract icon from: $targetPath" }
         }
     }
-    return $null
+    if ($imageSource) { $global:IconCache[$cacheKey] = $imageSource }
+    return $imageSource
 }
 
-$runningProcesses = Get-CimInstance Win32_Process -Property CommandLine
-
-$global:Apps | Where-Object { $_.AutoLaunch -eq $true } | ForEach-Object {
-    $expandedPath = [System.Environment]::ExpandEnvironmentVariables($_.Path)
-    $expandedArgs = [System.Environment]::ExpandEnvironmentVariables($_.Arguments)
+function Test-AppProcessRunning {
+    param([object]$App, [object[]]$Processes)
+    $expandedPath = Resolve-LauncherPath -Path $App.Path
+    $expandedArgs = [System.Environment]::ExpandEnvironmentVariables($App.Arguments)
     $fileName = [System.IO.Path]::GetFileName($expandedPath)
-    
     $matchPath = if ($expandedPath -match '\\') { [regex]::Escape($expandedPath) } else { [regex]::Escape($fileName) }
     $matchArgs = if (-not [string]::IsNullOrWhiteSpace($expandedArgs)) { [regex]::Escape($expandedArgs) } else { $null }
-    
-    $isRunning = $false
-    foreach ($proc in $runningProcesses) {
+    foreach ($proc in $Processes) {
         if ([string]::IsNullOrWhiteSpace($proc.CommandLine)) { continue }
-        if ($proc.CommandLine -match $matchPath) {
-            if (-not $matchArgs -or $proc.CommandLine -match $matchArgs) {
-                $isRunning = $true
-                break
-            }
-        }
+        if ($proc.CommandLine -match $matchPath -and (-not $matchArgs -or $proc.CommandLine -match $matchArgs)) { return $true }
     }
+    return $false
+}
 
-    if (-not $isRunning) {
-        Invoke-AdminApp -Path $_.Path -Arguments $_.Arguments
-    }
+function Invoke-AutoLaunchMonitor {
+    try {
+        $runningProcesses = Get-CimInstance Win32_Process -Property CommandLine
+        foreach ($app in ($global:Apps | Where-Object { $_.AutoLaunch -eq $true })) {
+            if (-not (Test-AppProcessRunning -App $app -Processes $runningProcesses)) { Invoke-AdminApp -Path $app.Path -Arguments $app.Arguments }
+        }
+    } catch { Write-Warning "Auto-launch monitor failed: $_" }
+}
+
+function Add-AppFromDroppedFile {
+    param([string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($FilePath)) { return }
+    $extension = [System.IO.Path]::GetExtension($FilePath)
+    if ($extension -notin @('.exe', '.lnk')) { return }
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
+    $global:Apps += [pscustomobject]@{ Name = $name; Path = $FilePath; Arguments = ''; Icon = ''; AutoLaunch = $false; Pinned = $false }
+    $global:AppConfig.Apps = @($global:Apps)
+    Save-LauncherConfig
+    Update-UIContainer
 }
 
 # -------------------------------------------------------------------------
@@ -409,7 +478,7 @@ $cardHover     = if ($global:IsDarkTheme) { "#38BDF8" }   else { "#00AEEF" }
 
         <!-- ── App tile grid (StackPanel for stretching height) ── -->
         <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Disabled" HorizontalScrollBarVisibility="Auto" Margin="0,0,0,0">
-            <StackPanel Name="AppContainer" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Stretch"/>
+            <StackPanel Name="AppContainer" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Stretch" AllowDrop="True"/>
         </ScrollViewer>
 
         <!-- ── Toolbar Controls ── -->
@@ -518,7 +587,22 @@ $window.Add_PreviewMouseLeftButtonDown({
 
 # Custom close button handler
 $btnClose.Add_Click({
-    $window.Close()
+    $window.Hide()
+    if ($global:NotifyIcon) { $global:NotifyIcon.ShowBalloonTip(1500, 'Admin App Launcher', 'Launcher minimized to the system tray.', [System.Windows.Forms.ToolTipIcon]::Info) }
+})
+
+$AppContainer.Add_PreviewDragOver({
+    param($sender, $e)
+    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = [System.Windows.DragDropEffects]::Copy }
+    else { $e.Effects = [System.Windows.DragDropEffects]::None }
+    $e.Handled = $true
+})
+
+$AppContainer.Add_PreviewDrop({
+    param($sender, $e)
+    if (-not $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { return }
+    foreach ($file in @($e.Data.GetData([System.Windows.DataFormats]::FileDrop))) { Add-AppFromDroppedFile -FilePath $file }
+    $e.Handled = $true
 })
 
 function Update-UIContainer {
@@ -526,7 +610,7 @@ function Update-UIContainer {
 
     $window.Dispatcher.Invoke({
         $AppContainer.Children.Clear()
-        foreach ($app in $global:Apps) {
+        foreach ($app in ($global:Apps | Sort-Object -Property @{Expression={ -not [bool]$_.Pinned }}, Name)) {
             $btn = New-Object System.Windows.Controls.Button
             $btn.Margin  = "3"
             $btn.Style   = $window.Resources["AppTileButton"]
@@ -554,6 +638,29 @@ function Update-UIContainer {
             $btn.Content = $viewbox
             $btn.Tag     = $app
 
+            $ctxMenu = New-Object System.Windows.Controls.ContextMenu
+            $miEdit = New-Object System.Windows.Controls.MenuItem; $miEdit.Header = 'Edit'
+            $miDelete = New-Object System.Windows.Controls.MenuItem; $miDelete.Header = 'Delete'
+            $miAuto = New-Object System.Windows.Controls.MenuItem; $miAuto.Header = if ($app.AutoLaunch) { 'Remove from Auto-Launch' } else { 'Add to Auto-Launch' }
+            $miPin = New-Object System.Windows.Controls.MenuItem; $miPin.Header = if ($app.Pinned) { 'Unpin' } else { 'Pin' }
+            $miStandard = New-Object System.Windows.Controls.MenuItem; $miStandard.Header = 'Launch as Standard User'
+            $miEdit.Tag = $app; $miDelete.Tag = $app; $miAuto.Tag = $app; $miPin.Tag = $app; $miStandard.Tag = $app
+            $miEdit.Add_Click({ param($sender, $e) Show-ConfigEditor -InitialAppName $sender.Tag.Name })
+            $miDelete.Add_Click({
+                param($sender, $e)
+                $target = $sender.Tag
+                if ([System.Windows.MessageBox]::Show("Delete '$($target.Name)' from the launcher?", 'Confirm Delete', 4, 32) -eq 'Yes') {
+                    $global:Apps = @($global:Apps | Where-Object { $_ -ne $target })
+                    $global:AppConfig.Apps = @($global:Apps)
+                    Save-LauncherConfig; Update-UIContainer
+                }
+            })
+            $miAuto.Add_Click({ param($sender, $e) $sender.Tag.AutoLaunch = -not [bool]$sender.Tag.AutoLaunch; Save-LauncherConfig; Update-UIContainer })
+            $miPin.Add_Click({ param($sender, $e) $sender.Tag.Pinned = -not [bool]$sender.Tag.Pinned; Save-LauncherConfig; Update-UIContainer })
+            $miStandard.Add_Click({ param($sender, $e) Invoke-StandardUserApp -Path $sender.Tag.Path -Arguments $sender.Tag.Arguments })
+            @($miEdit, $miDelete, $miAuto, $miPin, (New-Object System.Windows.Controls.Separator), $miStandard) | ForEach-Object { $ctxMenu.Items.Add($_) | Out-Null }
+            $btn.ContextMenu = $ctxMenu
+
             $btn.Add_Click({
                 param($sender, $e)
                 $boundApp = $sender.Tag
@@ -568,7 +675,8 @@ function Update-UIContainer {
 # -------------------------------------------------------------------------
 # 6. HTML Config Editor
 # -------------------------------------------------------------------------
-$btnEditConfig.Add_Click({
+function Show-ConfigEditor {
+    param([string]$InitialAppName = '')
     $global:IsEditing = $true
     
     $HtmlContent = @'
@@ -759,10 +867,6 @@ $btnEditConfig.Add_Click({
             Launcher Configuration
         </h1>
         <div class="actions-group">
-            <button class="btn btn-ghost" onclick="toggleTheme()">
-                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-                Theme
-            </button>
             <button class="btn btn-secondary" onclick="openModal(-1)">
                 <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"></path></svg>
                 Add App
@@ -813,6 +917,10 @@ $btnEditConfig.Add_Click({
                 <div class="input-group">
                     <label class="input-label">Arguments (Optional)</label>
                     <input type="text" id="appArgs" class="input-control" placeholder="-v --silent" />
+                    <div style="margin-top:10px; display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                        <label class="checkbox-wrapper" style="margin-top:0;"><input type="checkbox" id="argMin" onchange="applyArgumentBuilder()" /><span class="checkbox-label">Run Minimized (/min)</span></label>
+                        <label class="checkbox-wrapper" style="margin-top:0;"><input type="checkbox" id="argMax" onchange="applyArgumentBuilder()" /><span class="checkbox-label">Run Maximized (/max)</span></label>
+                    </div>
                 </div>
                 <label class="checkbox-wrapper">
                     <input type="checkbox" id="appAuto" />
@@ -832,6 +940,7 @@ $btnEditConfig.Add_Click({
         var apps         = [];
         var currentTheme = "Dark";
         var editingIndex = -1;
+        var initialAppName = "__INITIAL_APP_NAME__";
 
         // ── Init ───────────────────────────────────────────────────────────
         try { configObj = JSON.parse(window.external.GetConfig()); } catch(e) {}
@@ -839,10 +948,26 @@ $btnEditConfig.Add_Click({
         currentTheme = configObj.Theme || "Dark";
         document.documentElement.setAttribute('data-theme', currentTheme);
 
-        // ── Theme toggle ───────────────────────────────────────────────────
-        function toggleTheme() {
-            currentTheme = (currentTheme === "Dark") ? "Light" : "Dark";
-            document.documentElement.setAttribute('data-theme', currentTheme);
+        // Theme is detected from Windows AppsUseLightTheme by PowerShell; no manual toggle is shown.
+
+        function setArgumentToken(token, enabled) {
+            var input = document.getElementById('appArgs');
+            var parts = input.value ? input.value.split(/\s+/) : [];
+            var filtered = [];
+            for (var i = 0; i < parts.length; i++) { if (parts[i] && parts[i].toLowerCase() !== token.toLowerCase()) filtered.push(parts[i]); }
+            if (enabled) filtered.push(token);
+            input.value = filtered.join(' ');
+        }
+
+        function applyArgumentBuilder() {
+            setArgumentToken('/min', document.getElementById('argMin').checked);
+            setArgumentToken('/max', document.getElementById('argMax').checked);
+        }
+
+        function syncArgumentBuilder(args) {
+            args = args || '';
+            document.getElementById('argMin').checked = /(^|\s)\/min(\s|$)/i.test(args);
+            document.getElementById('argMax').checked = /(^|\s)\/max(\s|$)/i.test(args);
         }
 
         // ── Reorder helpers (replaces broken HTML5 drag-and-drop) ──────────
@@ -916,6 +1041,7 @@ $btnEditConfig.Add_Click({
             document.getElementById('appIcon').value  = app.Icon      || '';
             document.getElementById('appArgs').value  = app.Arguments || '';
             document.getElementById('appAuto').checked = !!app.AutoLaunch;
+            syncArgumentBuilder(app.Arguments || '');
             document.getElementById('editModal').style.display = 'flex';
         }
 
@@ -929,7 +1055,8 @@ $btnEditConfig.Add_Click({
                 Path:       document.getElementById('appPath').value,
                 Icon:       document.getElementById('appIcon').value,
                 Arguments:  document.getElementById('appArgs').value,
-                AutoLaunch: document.getElementById('appAuto').checked
+                AutoLaunch: document.getElementById('appAuto').checked,
+                Pinned:     (editingIndex === -1) ? false : !!apps[editingIndex].Pinned
             };
             if (editingIndex === -1) { apps.push(updated); }
             else                     { apps[editingIndex] = updated; }
@@ -967,10 +1094,18 @@ $btnEditConfig.Add_Click({
 
         // ── Initial render ─────────────────────────────────────────────────
         renderGrid();
+        if (initialAppName) {
+            for (var initIndex = 0; initIndex < apps.length; initIndex++) {
+                if ((apps[initIndex].Name || '') === initialAppName) { openModal(initIndex); break; }
+            }
+        }
     </script>
 </body>
 </html>
 '@
+
+    $safeInitialAppName = ($InitialAppName -replace '\', '\\' -replace '"', '\"')
+    $HtmlContent = $HtmlContent.Replace('__INITIAL_APP_NAME__', $safeInitialAppName)
 
     $TempHtmlPath = Join-Path $env:TEMP "LauncherConfigEditor.html"
     $HtmlContent | Set-Content -Path $TempHtmlPath -Encoding UTF8
@@ -1034,11 +1169,64 @@ $btnEditConfig.Add_Click({
     
     # Release edit state lock
     $global:IsEditing = $false
-})
+}
+
+$btnEditConfig.Add_Click({ Show-ConfigEditor })
 
 # -------------------------------------------------------------------------
-# 7. Final Initialization
+# 7. System Tray, File Watcher, Timers & Final Initialization
 # -------------------------------------------------------------------------
+$global:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
+$global:NotifyIcon.Text = 'Admin App Launcher'
+$global:NotifyIcon.Icon = [System.Drawing.SystemIcons]::Application
+$global:NotifyIcon.Visible = $true
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$trayShow = $trayMenu.Items.Add('Show Launcher')
+$trayReload = $trayMenu.Items.Add('Reload Config')
+$trayExit = $trayMenu.Items.Add('Exit')
+$trayShow.Add_Click({ $window.Show(); $window.Activate() | Out-Null })
+$trayReload.Add_Click({ Reload-LauncherConfig })
+$trayExit.Add_Click({ $global:IsShuttingDown = $true; $global:NotifyIcon.Visible = $false; $window.Close() })
+$global:NotifyIcon.ContextMenuStrip = $trayMenu
+$global:NotifyIcon.Add_DoubleClick({ $window.Show(); $window.Activate() | Out-Null })
+
+$configWatcher = New-Object System.IO.FileSystemWatcher
+$configWatcher.Path = Split-Path -Path $ConfigPath -Parent
+$configWatcher.Filter = Split-Path -Path $ConfigPath -Leaf
+$configWatcher.NotifyFilter = [System.IO.NotifyFilters]'LastWrite, FileName, Size'
+$configWatcher.EnableRaisingEvents = $true
+$configReloadTimer = New-Object System.Windows.Threading.DispatcherTimer
+$configReloadTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$configReloadTimer.Add_Tick({ $configReloadTimer.Stop(); if (-not $global:SuppressConfigWatcher) { Reload-LauncherConfig } })
+$configWatcher.Add_Changed({ $window.Dispatcher.BeginInvoke([action]{ $configReloadTimer.Stop(); $configReloadTimer.Start() }) | Out-Null })
+$configWatcher.Add_Created({ $window.Dispatcher.BeginInvoke([action]{ $configReloadTimer.Stop(); $configReloadTimer.Start() }) | Out-Null })
+$configWatcher.Add_Renamed({ $window.Dispatcher.BeginInvoke([action]{ $configReloadTimer.Stop(); $configReloadTimer.Start() }) | Out-Null })
+
+$processMonitorTimer = New-Object System.Windows.Threading.DispatcherTimer
+$processMonitorTimer.Interval = [TimeSpan]::FromSeconds(30)
+$processMonitorTimer.Add_Tick({ Invoke-AutoLaunchMonitor })
+$processMonitorTimer.Start()
+Invoke-AutoLaunchMonitor
+
+$themePollTimer = New-Object System.Windows.Threading.DispatcherTimer
+$themePollTimer.Interval = [TimeSpan]::FromSeconds(20)
+$themePollTimer.Add_Tick({
+    $newIsDark = -not (Get-SystemUsesLightTheme)
+    if ($newIsDark -ne $global:IsDarkTheme) {
+        $global:IsDarkTheme = $newIsDark
+        $global:AppConfig.Theme = if ($newIsDark) { 'Dark' } else { 'Light' }
+        [Win11Interop8.Theme]::ApplyMica($window, $global:IsDarkTheme)
+    }
+})
+$themePollTimer.Start()
+
+$window.Add_Closing({
+    param($sender, $e)
+    if (-not $global:IsShuttingDown) { $e.Cancel = $true; $window.Hide(); return }
+    if ($global:NotifyIcon) { $global:NotifyIcon.Visible = $false; $global:NotifyIcon.Dispose() }
+    if ($configWatcher) { $configWatcher.EnableRaisingEvents = $false; $configWatcher.Dispose() }
+})
+
 Update-UIContainer
 
 $window.Add_SourceInitialized({
